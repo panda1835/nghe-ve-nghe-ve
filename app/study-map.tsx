@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent } from "react";
 import { buildPartition, groupProvinces, linePath, MAP_HEIGHT, MAP_WIDTH, type DrawnLine, type Partition, type Point, type StudyProvince, type StudyBorder } from "./lib/dialect-regions";
 
+import { startPinch, movePinch, MIN_MAP_ZOOM, MAX_MAP_ZOOM, type MapView, type PinchGesture } from "./lib/map-gestures";
 import { ARCHIPELAGOS } from "./lib/archipelagos";
 
 const pixel = "font-[family-name:var(--font-pixel)]";
@@ -36,8 +37,14 @@ export default function StudyMap({ provinces, borders }: { provinces: StudyProvi
   const [draft, setDraft] = useState<Point[]>([]);
   const [tool, setTool] = useState<"draw" | "borders" | "pan">("draw");
   const [labels, setLabels] = useState(true);
-  const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState<Point>([0, 0]);
+  const [view, setView] = useState<MapView>({ zoom: 1, pan: [0, 0] });
+  const { zoom, pan } = view;
+  const viewRef = useRef<MapView>(view);
+  const touches = useRef(new Map<number, Point>());
+  const pinch = useRef<PinchGesture | null>(null);
+  // Latches until every finger lifts: the remaining finger must not draw.
+  const twoFingerSession = useRef(false);
+  const suppressClick = useRef(false);
   const [partition, setPartition] = useState<Partition | null>(null);
   const [status, setStatus] = useState("");
   const [ready, setReady] = useState(false);
@@ -92,26 +99,72 @@ export default function StudyMap({ provinces, borders }: { provinces: StudyProvi
     const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(matrix.inverse());
     return [Math.max(0, Math.min(MAP_WIDTH, p.x)), Math.max(0, Math.min(MAP_HEIGHT, p.y))];
   }
+  function updateView(next: MapView) { viewRef.current = next; setView(next); }
+  function svgPoint(client: Point): Point {
+    const matrix = svg.current?.getScreenCTM();
+    if (!matrix) return [0, 0];
+    const p = new DOMPoint(...client).matrixTransform(matrix.inverse());
+    return [p.x, p.y];
+  }
+  function beginPinch() {
+    const pair = [...touches.current.values()].slice(0, 2).map(svgPoint);
+    if (pair.length === 2) pinch.current = startPinch(pair[0], pair[1], viewRef.current);
+  }
   function pointerDown(e: PointerEvent<SVGSVGElement>) {
-    if (e.button !== 0 || pointer.current) return;
-    if (tool === "borders") return;
+    if (e.button !== 0) return;
+    if (e.pointerType === "touch") {
+      if (touches.current.size === 0) { twoFingerSession.current = false; suppressClick.current = false; }
+      touches.current.set(e.pointerId, [e.clientX, e.clientY]);
+      if (touches.current.size >= 2) {
+        e.preventDefault();
+        twoFingerSession.current = true; suppressClick.current = true;
+        pointer.current = null; setDraft([]);
+        // Capture both fingers even if they started on different provinces.
+        for (const id of touches.current.keys()) e.currentTarget.setPointerCapture(id);
+        if (touches.current.size === 2) beginPinch();
+        return;
+      }
+      if (twoFingerSession.current) return;
+    } else if (!touches.current.size) suppressClick.current = false;
+    if (pointer.current || tool === "borders") return;
     const p = mapPoint(e); e.currentTarget.setPointerCapture(e.pointerId);
-    pointer.current = { id: e.pointerId, point: [e.clientX, e.clientY], pan, mode: tool, points: [p] };
+    pointer.current = { id: e.pointerId, point: [e.clientX, e.clientY], pan: viewRef.current.pan, mode: tool, points: [p] };
     if (tool === "draw") setDraft([p]);
   }
   function pointerMove(e: PointerEvent<SVGSVGElement>) {
+    if (touches.current.has(e.pointerId)) {
+      touches.current.set(e.pointerId, [e.clientX, e.clientY]);
+      if (twoFingerSession.current) {
+        e.preventDefault();
+        const pair = [...touches.current.values()].slice(0, 2).map(svgPoint);
+        if (pair.length === 2 && pinch.current) updateView(movePinch(pinch.current, pair[0], pair[1]));
+        return;
+      }
+    }
     const state = pointer.current; if (!state || state.id !== e.pointerId) return;
     if (state.mode === "pan") {
-      const bounds = svg.current!.getBoundingClientRect(), scale = Math.max(740 / bounds.width, 800 / bounds.height);
-      setPan([state.pan[0] + (e.clientX - state.point[0]) * scale, state.pan[1] + (e.clientY - state.point[1]) * scale]); return;
+      const start = svgPoint(state.point), current = svgPoint([e.clientX, e.clientY]);
+      updateView({ zoom: viewRef.current.zoom, pan: [state.pan[0] + current[0] - start[0], state.pan[1] + current[1] - start[1]] }); return;
     }
     const p = mapPoint(e), last = state.points.at(-1)!;
     if (Math.hypot(p[0] - last[0], p[1] - last[1]) >= 1.5) { state.points.push(p); setDraft([...state.points]); }
   }
-  function pointerUp(e: PointerEvent<SVGSVGElement>) {
-    const state = pointer.current; if (!state || state.id !== e.pointerId) return;
-    pointer.current = null;
-    if (state.mode === "draw") { const p = mapPoint(e); finishLine([...state.points, p]); }
+  function endPointer(e: PointerEvent<SVGSVGElement>, cancelled = false) {
+    const wasTouch = touches.current.delete(e.pointerId);
+    if (wasTouch && twoFingerSession.current) {
+      pointer.current = null; setDraft([]);
+      if (touches.current.size >= 2) beginPinch();
+      else pinch.current = null;
+      // Keep the session latched with one finger down. No accidental line or tap.
+      if (!touches.current.size) twoFingerSession.current = false;
+    } else {
+      const state = pointer.current;
+      if (state?.id === e.pointerId) {
+        pointer.current = null;
+        if (!cancelled && state.mode === "draw") finishLine([...state.points, mapPoint(e)]);
+        else setDraft([]);
+      }
+    }
     if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
   }
   const lineItems = useMemo(() => response.lines.map((line, i) => ({ ...line, number: i + 1 })), [response.lines]);
@@ -136,9 +189,9 @@ export default function StudyMap({ provinces, borders }: { provinces: StudyProvi
         <div className="flex flex-wrap gap-2" aria-label="Công cụ vẽ">{([['draw', 'Vẽ'], ['borders', 'Chọn ranh giới tỉnh'], ['pan', 'Di chuyển']] as const).map(([value, label]) => <button key={value} aria-pressed={tool === value} onClick={() => { setTool(value); setDraft([]); }} className={`${control} ${tool === value ? "bg-[#d5dfbf] underline underline-offset-4" : ""}`}><ToolbarIcon name={value} />{label}</button>)}</div>
         <div className="flex gap-2"><button onClick={undo} disabled={!history.length && !draft.length} className={control}><ToolbarIcon name="undo" />Hoàn tác</button><button onClick={redo} disabled={!future.length || !!draft.length} className={control}><ToolbarIcon name="redo" />Làm lại</button></div>
       </div>
-      <p className="border-b border-[#b4c2a3] bg-[#f5f5e9] px-4 py-3 text-[11px] leading-5 text-[#56674e]">{tool === "draw" ? "Nhấn giữ và kéo để vẽ. Thả tay để kết thúc nét vẽ." : tool === "borders" ? "Chọn đường ranh giữa hai tỉnh để chia vùng. Chọn lần nữa để bỏ." : "Nhấn giữ và kéo để di chuyển bản đồ."}</p>
+      <p className="border-b border-[#b4c2a3] bg-[#f5f5e9] px-4 py-3 text-[11px] leading-5 text-[#56674e]">{tool === "draw" ? "Nhấn giữ và kéo để vẽ. Thả tay để kết thúc nét vẽ." : tool === "borders" ? "Chọn đường ranh giữa hai tỉnh để chia vùng. Chọn lần nữa để bỏ." : "Nhấn giữ và kéo để di chuyển bản đồ."}<span className="mt-1 block sm:mt-0 sm:ml-2 sm:inline">Dùng hai ngón tay để thu phóng và di chuyển.</span></p>
       <div className="relative h-[620px] bg-[radial-gradient(#aebd9b_0.65px,transparent_0.65px)] bg-size-[14px_14px] sm:h-[720px]">
-        <svg ref={svg} viewBox="70 0 740 800" role="group" aria-label="Vẽ ranh giới các vùng giọng nói trên bản đồ Việt Nam" tabIndex={0} className={`h-full w-full touch-none select-none focus-visible:outline-2 focus-visible:-outline-offset-4 focus-visible:outline-[#a44d37] ${tool === "pan" ? "cursor-grab active:cursor-grabbing" : "cursor-crosshair"}`} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={() => { pointer.current = null; setDraft([]); }} onKeyDown={e => { if (e.key === "Escape") setDraft([]); if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { e.preventDefault(); if (e.shiftKey) redo(); else undo(); } }}>
+        <svg ref={svg} viewBox="70 0 740 800" role="group" aria-label="Vẽ ranh giới các vùng giọng nói trên bản đồ Việt Nam" tabIndex={0} className={`h-full w-full touch-none select-none focus-visible:outline-2 focus-visible:-outline-offset-4 focus-visible:outline-[#a44d37] ${tool === "pan" ? "cursor-grab active:cursor-grabbing" : "cursor-crosshair"}`} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={e => endPointer(e)} onPointerCancel={e => endPointer(e, true)} onLostPointerCapture={e => { if (e.target === e.currentTarget && (touches.current.has(e.pointerId) || pointer.current?.id === e.pointerId)) endPointer(e, true); }} onClickCapture={e => { if (suppressClick.current && e.detail !== 0) { e.preventDefault(); e.stopPropagation(); } }} onKeyDown={e => { if (e.key === "Escape") setDraft([]); if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { e.preventDefault(); if (e.shiftKey) redo(); else undo(); } }}>
           <g ref={group} transform={`translate(${360 + pan[0]} ${400 + pan[1]}) scale(${zoom}) translate(-335 -400)`}>
             {provinces.map(p => <path key={p.id} d={p.path} fill={partition?.regions[partition.assignments[p.id]]?.color || "#b8cfa0"} className="pointer-events-none stroke-[#52664b] stroke-[0.8]"><title>{p.name}</title></path>)}
             {ARCHIPELAGOS.map(a => <g key={a.name} aria-label={`${a.name}, ký hiệu đảo được phóng to`}><title>{a.name} — chỉ thể hiện một số đảo, đá theo tọa độ tham khảo; không phải đường bờ</title>{a.islands.map(({ name, point: [x, y] }) => <rect key={name} x={x - 2} y={y - 2} width="4" height="4" fill={partition?.regions[partition.assignments[a.provinceId]]?.color || "#b8cfa0"} className="stroke-[#52664b] stroke-[0.8]"><title>{name}</title></rect>)}<text x={a.label[0]} y={a.label[1]} textAnchor="middle" className={`${pixel} pointer-events-none fill-[#243c32] text-[12px]`}>{a.name}</text></g>)}
@@ -151,7 +204,7 @@ export default function StudyMap({ provinces, borders }: { provinces: StudyProvi
             {!!draft.length && <g className="pointer-events-none"><path d={linePath(draft)} fill="none" className="stroke-[#a54b33] stroke-[2.5] [vector-effect:non-scaling-stroke]" /></g>}
           </g>
         </svg>
-        <div className="absolute bottom-4 left-4 flex border-2 border-[#52664b] bg-[#faf9f0]"><button aria-label="Thu nhỏ bản đồ" disabled={zoom <= .65} onClick={() => setZoom(z => Math.max(.65, z - .35))} className="h-10 w-10 cursor-pointer text-xl hover:bg-[#dfe6d0] disabled:opacity-30">−</button><button aria-label="Đưa bản đồ về vị trí ban đầu" onClick={() => { setZoom(1); setPan([0, 0]); }} className="cursor-pointer border-x border-[#bec9ad] px-3 text-[11px] hover:bg-[#dfe6d0]">{Math.round(zoom * 100)}%</button><button aria-label="Phóng to bản đồ" disabled={zoom >= 4} onClick={() => setZoom(z => Math.min(4, z + .35))} className="h-10 w-10 cursor-pointer text-xl hover:bg-[#dfe6d0] disabled:opacity-30">+</button></div>
+        <div className="absolute bottom-4 left-4 flex border-2 border-[#52664b] bg-[#faf9f0]"><button aria-label="Thu nhỏ bản đồ" disabled={zoom <= MIN_MAP_ZOOM} onClick={() => updateView({ ...viewRef.current, zoom: Math.max(MIN_MAP_ZOOM, viewRef.current.zoom - .35) })} className="h-10 w-10 cursor-pointer text-xl hover:bg-[#dfe6d0] disabled:opacity-30">−</button><button aria-label="Đưa bản đồ về vị trí ban đầu" onClick={() => updateView({ zoom: 1, pan: [0, 0] })} className="cursor-pointer border-x border-[#bec9ad] px-3 text-[11px] hover:bg-[#dfe6d0]">{Math.round(zoom * 100)}%</button><button aria-label="Phóng to bản đồ" disabled={zoom >= MAX_MAP_ZOOM} onClick={() => updateView({ ...viewRef.current, zoom: Math.min(MAX_MAP_ZOOM, viewRef.current.zoom + .35) })} className="h-10 w-10 cursor-pointer text-xl hover:bg-[#dfe6d0] disabled:opacity-30">+</button></div>
 
       </div>
     </section>

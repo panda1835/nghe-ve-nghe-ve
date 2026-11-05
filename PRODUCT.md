@@ -15,3 +15,6 @@ Community-maintained province geometry from thanglequoc/vietnamese-provinces-dat
 Participants begin with no predefined dialect labels or lines. Multiple freehand lines and province-boundary selections are supported; point-to-point input is removed. Drafts stay in local browser storage, and responses export as JSON; there is no server submission or collection backend. The user confirmed keeping provinces whole and assigning them by their mapped centers when a drawn line passes through them. Keep participant instructions functional and omit decorative slogans.
 
 Island markers use named, sourced geographic reference points, with enlarged symbols rather than fabricated island outlines. They show a selected subset, not complete archipelago geometry. Sources and coordinates are recorded in app/lib/archipelagos.ts.
+
+## Mobile Map Gestures
+Two touch pointers always control simultaneous pinch zoom and pan, regardless of the selected tool. One pointer retains the active drawing, border-selection, or Pan behavior. A second finger cancels an unfinished stroke; drawing resumes only after every finger lifts. Gesture-generated clicks must not toggle province borders.
